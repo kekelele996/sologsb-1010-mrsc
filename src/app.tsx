@@ -1,8 +1,18 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import {
+  BATCH_LIMIT,
+  RECORD_LIMIT,
+  captureBatchContent,
+  createBatch,
+  createRecord,
+  diffBatchContent,
+  issueFingerprint,
+} from './batches';
+import type { BatchDiff, LineDiffEntry } from './batches';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, ProofBatch, ProofIssue, ProjectState, TextbookLine } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -10,8 +20,7 @@ const HISTORY_LIMIT = 60;
 type HistoryAction =
   | { type: 'commit'; label: string; update: (state: ProjectState) => ProjectState }
   | { type: 'undo' }
-  | { type: 'redo' }
-  | { type: 'restore'; label: string; state: ProjectState };
+  | { type: 'redo' };
 
 function cloneState(state: ProjectState): ProjectState {
   return structuredClone(state);
@@ -40,7 +49,7 @@ function historyReducer(state: HistoryState, action: HistoryAction): HistoryStat
     };
   }
 
-  const next = action.type === 'restore' ? cloneState(action.state) : action.update(cloneState(state.present));
+  const next = action.update(cloneState(state.present));
   if (next === state.present) return state;
   return {
     past: [...state.past, state.present].slice(-HISTORY_LIMIT),
@@ -50,12 +59,29 @@ function historyReducer(state: HistoryState, action: HistoryAction): HistoryStat
   };
 }
 
+/** 兼容旧版整份快照：把每个旧快照转成只含起点的批次。 */
+function migrateProject(parsed: any): ProjectState {
+  if (Array.isArray(parsed?.batches)) return parsed as ProjectState;
+  const legacyVersions: any[] = Array.isArray(parsed?.versions) ? parsed.versions : [];
+  const batches: ProofBatch[] = legacyVersions
+    .filter((version) => Array.isArray(version?.snapshot?.lines))
+    .map((version) => ({
+      id: typeof version.id === 'string' ? version.id : `batch-${Math.random().toString(36).slice(2, 8)}`,
+      name: typeof version.name === 'string' ? version.name : '迁移的旧快照',
+      createdAt: typeof version.createdAt === 'string' ? version.createdAt : new Date().toISOString(),
+      baseline: captureBatchContent(version.snapshot as ProjectState),
+      records: [],
+    }));
+  const { versions: _legacyVersions, ...rest } = parsed ?? {};
+  return { ...rest, batches } as ProjectState;
+}
+
 function loadInitialState(): ProjectState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      const parsed = JSON.parse(raw);
+      return analyzeProject(migrateProject(parsed));
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -78,9 +104,8 @@ function useProject() {
   const commit = (label: string, update: (state: ProjectState) => ProjectState) => dispatch({ type: 'commit', label, update });
   const undo = () => dispatch({ type: 'undo' });
   const redo = () => dispatch({ type: 'redo' });
-  const restore = (state: ProjectState) => dispatch({ type: 'restore', label: '恢复版本', state });
 
-  return { state: history.present, history, commit, undo, redo, restore };
+  return { state: history.present, history, commit, undo, redo };
 }
 
 function formatTime(value: string): string {
@@ -454,34 +479,226 @@ function RuleDetailPanel({ state, onUpdateRule, onDeleteRule }: { state: Project
   );
 }
 
-function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; onSnapshot: () => void; onRestore: (version: VersionSnapshot) => void }) {
+function DiffDetails({
+  diff,
+  beforeLabel,
+  afterLabel,
+  newIssuesLabel = '新出现的问题',
+  resolvedIssuesLabel = '已处理的问题',
+}: {
+  diff: BatchDiff;
+  beforeLabel: string;
+  afterLabel: string;
+  newIssuesLabel?: string;
+  resolvedIssuesLabel?: string;
+}) {
+  if (!diff.hasChanges) return <p class="diff-empty">两边内容一致，没有差异。</p>;
+
+  const tagFor = (kind: LineDiffEntry['kind']) => (kind === 'added' ? '新增' : kind === 'removed' ? '缺失' : '变化');
+  const lineNoFor = (entry: LineDiffEntry) =>
+    entry.kind === 'removed' ? `${beforeLabel}第 ${entry.beforeIndex + 1} 行` : `${afterLabel}第 ${entry.afterIndex + 1} 行`;
+
+  const issueList = (entries: BatchDiff['newIssues'], className: string) => (
+    <ul>
+      {entries.slice(0, 8).map(({ issue, lineNumber }) => (
+        <li class={`diff-issue ${className}`} key={issue.key}>
+          <span class={`severity-dot ${issue.severity}`} />
+          <span>{lineNumber > 0 ? `第 ${lineNumber} 行` : '已缺失的行'} · {issue.message}</span>
+        </li>
+      ))}
+      {entries.length > 8 && <li class="diff-more">…其余 {entries.length - 8} 条从略</li>}
+    </ul>
+  );
+
+  return (
+    <div class="diff-details">
+      {diff.lines.length > 0 && (
+        <div class="diff-block">
+          <strong>课文行 · 新增 {diff.addedCount} · 缺失 {diff.removedCount} · 变化 {diff.changedCount}</strong>
+          <ul>
+            {diff.lines.slice(0, 10).map((entry) => (
+              <li class={`diff-line ${entry.kind}`} key={entry.lineId}>
+                <span class="diff-tag">{tagFor(entry.kind)}</span>
+                <div class="diff-line-body">
+                  <span class="diff-line-no">
+                    {lineNoFor(entry)}
+                    {entry.fields.length > 0 && ` · 改了${entry.fields.join('、')}`}
+                  </span>
+                  {entry.kind !== 'added' && <span class="diff-source">{entry.before?.source.trim() || '（空行）'}</span>}
+                  {entry.kind === 'changed' && entry.before?.source !== entry.after?.source && <span class="diff-arrow">→</span>}
+                  {entry.kind !== 'removed' && (entry.kind === 'added' || entry.before?.source !== entry.after?.source) && (
+                    <span class="diff-source after">{entry.after?.source.trim() || '（空行）'}</span>
+                  )}
+                </div>
+              </li>
+            ))}
+            {diff.lines.length > 10 && <li class="diff-more">…其余 {diff.lines.length - 10} 行从略</li>}
+          </ul>
+        </div>
+      )}
+      {diff.ruleChanges.length > 0 && (
+        <div class="diff-block">
+          <strong>规则变化（{diff.ruleChanges.length}）</strong>
+          <ul>
+            {diff.ruleChanges.slice(0, 8).map((change, index) => <li class="diff-rule" key={index}>{change}</li>)}
+            {diff.ruleChanges.length > 8 && <li class="diff-more">…其余 {diff.ruleChanges.length - 8} 项从略</li>}
+          </ul>
+        </div>
+      )}
+      {diff.newIssues.length > 0 && (
+        <div class="diff-block">
+          <strong>{newIssuesLabel}（{diff.newIssues.length}）</strong>
+          {issueList(diff.newIssues, 'new')}
+        </div>
+      )}
+      {diff.resolvedIssues.length > 0 && (
+        <div class="diff-block">
+          <strong>{resolvedIssuesLabel}（{diff.resolvedIssues.length}）</strong>
+          {issueList(diff.resolvedIssues, 'resolved')}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BatchesPanel({
+  state,
+  onStartBatch,
+  onRecord,
+  onRestore,
+}: {
+  state: ProjectState;
+  onStartBatch: (name: string) => void;
+  onRecord: () => void;
+  onRestore: (batch: ProofBatch) => void;
+}) {
+  const [batchName, setBatchName] = useState('');
+  const [previewBatchId, setPreviewBatchId] = useState<string | null>(null);
+  const [expandedRecordId, setExpandedRecordId] = useState<string | null>(null);
+  const currentContent = useMemo(() => captureBatchContent(state), [state]);
+  const latestBatch = state.batches[0];
+
   return (
     <div class="inspector-body">
-      <div class="snapshot-callout">
-        <div><strong>本地版本记录</strong><p>保存当前规则、原文、状态和备注的完整快照。</p></div>
-        <md-filled-button onClick={onSnapshot}>记录版本</md-filled-button>
-      </div>
-      {state.versions.length === 0 && <div class="empty-state compact"><strong>还没有版本快照</strong><p>完成一轮校对后记录版本，便于比较和恢复。</p></div>}
-      <div class="timeline">
-        {state.versions.map((version) => (
-          <div class="timeline-item" key={version.id}>
-            <span class="timeline-dot" />
-            <div>
-              <strong>{version.name}</strong>
-              <p>{version.action} · {formatTime(version.createdAt)}</p>
-              <div class="metric-row"><span>{version.snapshot.lines.length} 行</span><span>{version.snapshot.issues.filter((issue) => !issue.resolved).length} 个未处理问题</span></div>
-              <md-text-button onClick={() => onRestore(version)}>恢复此版本</md-text-button>
-            </div>
+      <div class="snapshot-callout batch-start">
+        <div>
+          <strong>可命名校对批次</strong>
+          <p>开始批次时保留当时的课文、规则集和未处理问题；之后每次记录都会与批次起点逐行比较。</p>
+        </div>
+        <div class="batch-start-form">
+          <md-outlined-text-field
+            value={batchName}
+            label={`批次名称（留空：第 ${state.batches.length + 1} 轮校对）`}
+            onInput={(event: any) => setBatchName(event.currentTarget.value)}
+          />
+          <div class="batch-start-actions">
+            <md-filled-button onClick={() => { onStartBatch(batchName); setBatchName(''); }}>开始批次</md-filled-button>
+            <md-filled-tonal-button disabled={!latestBatch} title={latestBatch ? `记录到「${latestBatch.name}」` : '先开始一个批次'} onClick={onRecord}>
+              记录到当前批次
+            </md-filled-tonal-button>
           </div>
-        ))}
+          {latestBatch && <p class="batch-current">当前批次：「{latestBatch.name}」 · 已记录 {latestBatch.records.length} 次</p>}
+        </div>
       </div>
+
+      {state.batches.length === 0 && (
+        <div class="empty-state compact"><strong>还没有校对批次</strong><p>命名并开始一个批次，之后每次记录都会按行给出新增、缺失和变化，并分清新出现与已处理的问题。</p></div>
+      )}
+
+      {state.batches.map((batch) => {
+        const activeSet = batch.baseline.ruleSets.find((ruleSet) => ruleSet.id === batch.baseline.activeRuleSetId) ?? batch.baseline.ruleSets[0];
+        const previewing = previewBatchId === batch.id;
+        const previewDiff = previewing ? diffBatchContent(currentContent, batch.baseline) : null;
+        return (
+          <div class="batch-card" key={batch.id}>
+            <div class="batch-head">
+              <div>
+                <strong>{batch.name}</strong>
+                <p>
+                  开始于 {formatTime(batch.createdAt)} · {batch.baseline.lines.length} 行 · {batch.baseline.openIssues.length} 个未处理问题
+                  {activeSet && ` · ${activeSet.name}（${activeSet.rules.filter((rule) => rule.enabled).length} 条启用）`}
+                </p>
+              </div>
+              <md-text-button onClick={() => setPreviewBatchId(previewing ? null : batch.id)}>
+                {previewing ? '收起预览' : '恢复此批次'}
+              </md-text-button>
+            </div>
+
+            {previewing && previewDiff && (
+              <div class="restore-preview">
+                <strong>恢复预览：当前稿 → 「{batch.name}」起点</strong>
+                {!previewDiff.hasChanges ? (
+                  <p class="diff-empty">当前稿与批次起点一致，无需恢复。</p>
+                ) : (
+                  <>
+                    <p class="restore-summary">
+                      将影响 {previewDiff.lines.length} 行（补回 {previewDiff.addedCount} · 移除 {previewDiff.removedCount} · 改回 {previewDiff.changedCount}）
+                      {previewDiff.ruleChanges.length > 0 && ` · 规则变化 ${previewDiff.ruleChanges.length} 项`}
+                      {previewDiff.newIssues.length + previewDiff.resolvedIssues.length > 0 && ` · 问题变化 ${previewDiff.newIssues.length + previewDiff.resolvedIssues.length} 条`}
+                    </p>
+                    <DiffDetails
+                      diff={previewDiff}
+                      beforeLabel="当前稿"
+                      afterLabel="批次"
+                      newIssuesLabel="恢复后重新出现的问题"
+                      resolvedIssuesLabel="恢复后不再出现的问题"
+                    />
+                  </>
+                )}
+                <div class="restore-actions">
+                  <md-text-button onClick={() => setPreviewBatchId(null)}>取消</md-text-button>
+                  <md-filled-button disabled={!previewDiff.hasChanges} onClick={() => { onRestore(batch); setPreviewBatchId(null); }}>
+                    应用恢复
+                  </md-filled-button>
+                </div>
+              </div>
+            )}
+
+            {batch.records.length === 0 && <p class="batch-empty">还没有记录。用上方“记录到当前批次”留下第一条对比。</p>}
+            {batch.records.length > 0 && (
+              <div class="record-list">
+                {batch.records.map((record) => {
+                  const diff = diffBatchContent(batch.baseline, record.content);
+                  const expanded = expandedRecordId === record.id;
+                  return (
+                    <div class={`record-item ${record.kind}`} key={record.id}>
+                      <div class="record-head">
+                        <div>
+                          <strong>
+                            {record.kind === 'restore' && <span class="restore-badge">恢复</span>}
+                            {record.action}
+                          </strong>
+                          <p>{formatTime(record.createdAt)} · {record.content.lines.length} 行 · {record.content.openIssues.length} 个未处理问题</p>
+                        </div>
+                        <md-text-button onClick={() => setExpandedRecordId(expanded ? null : record.id)}>
+                          {expanded ? '收起' : '查看差异'}
+                        </md-text-button>
+                      </div>
+                      <div class="diff-chips">
+                        {!diff.hasChanges && <span class="diff-chip same">与批次起点一致</span>}
+                        {diff.addedCount > 0 && <span class="diff-chip added">+{diff.addedCount} 新增行</span>}
+                        {diff.removedCount > 0 && <span class="diff-chip removed">−{diff.removedCount} 缺失行</span>}
+                        {diff.changedCount > 0 && <span class="diff-chip changed">~{diff.changedCount} 变化行</span>}
+                        {diff.newIssues.length > 0 && <span class="diff-chip issue-new">{diff.newIssues.length} 个新出现问题</span>}
+                        {diff.resolvedIssues.length > 0 && <span class="diff-chip issue-done">{diff.resolvedIssues.length} 个已处理问题</span>}
+                        {diff.ruleChanges.length > 0 && <span class="diff-chip rule">{diff.ruleChanges.length} 项规则变化</span>}
+                      </div>
+                      {expanded && <DiffDetails diff={diff} beforeLabel="批次" afterLabel="记录" />}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
 export default function App() {
-  const { state, history, commit, undo, redo, restore } = useProject();
-  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const { state, history, commit, undo, redo } = useProject();
+  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'batches'>('issues');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -525,7 +742,7 @@ export default function App() {
       }
       if (modifier && event.key.toLocaleLowerCase() === 's') {
         event.preventDefault();
-        recordVersion('快捷保存');
+        recordToBatch('快捷保存');
         return;
       }
       if (modifier && event.key === 'Enter') {
@@ -548,19 +765,62 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   });
 
-  const createSnapshot = (action: string, source = state): VersionSnapshot => {
-    const { versions: _versions, ...snapshot } = cloneState(source);
-    return {
-      id: `version-${Date.now().toString(36)}`,
-      name: `${action} · ${source.lines.filter((line) => line.status === 'approved').length}/${source.lines.length} 行完成`,
-      createdAt: new Date().toISOString(),
-      action,
-      snapshot,
-    };
+  const startBatch = (name: string) => {
+    commit('开始新批次', (current) => ({
+      ...current,
+      batches: [createBatch(name.trim() || `第 ${current.batches.length + 1} 轮校对`, current), ...current.batches].slice(0, BATCH_LIMIT),
+      updatedAt: new Date().toISOString(),
+    }));
   };
 
-  const recordVersion = (action = '手动记录') => {
-    commit('记录版本快照', (current) => ({ ...current, versions: [createSnapshot(action, current), ...current.versions].slice(0, 20), updatedAt: new Date().toISOString() }));
+  const recordToBatch = (action = '手动记录') => {
+    if (state.batches.length === 0) {
+      startBatch(action);
+      return;
+    }
+    commit('记录批次进度', (current) => {
+      const [latest, ...rest] = current.batches;
+      const record = createRecord(action, current);
+      return {
+        ...current,
+        batches: [{ ...latest, records: [record, ...latest.records].slice(0, RECORD_LIMIT) }, ...rest],
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  };
+
+  const applyRestore = (batch: ProofBatch) => {
+    commit(`恢复批次「${batch.name}」`, (current) => {
+      const baseline = batch.baseline;
+      const restoredLines: TextbookLine[] = baseline.lines.map((line) => ({
+        id: line.id,
+        source: line.source,
+        tokens: [],
+        status: line.status,
+        note: line.note,
+        continuesPrevious: false,
+        continuesNext: false,
+      }));
+      const analyzed = analyzeProject({
+        ...current,
+        activeRuleSetId: baseline.activeRuleSetId,
+        ruleSets: structuredClone(baseline.ruleSets),
+        lines: restoredLines,
+        selectedLineId: baseline.lines[0]?.id ?? '',
+      });
+      // 重新分析会生成全新问题，按批次起点把当时已处理的问题重新标记为已处理。
+      const openKeys = new Set(baseline.openIssues.map((issue) => issue.key));
+      const issues = analyzed.issues.map((item) => ({ ...item, resolved: !openKeys.has(issueFingerprint(item)) }));
+      const restored: ProjectState = { ...analyzed, issues };
+      // 恢复行动本身也留痕：作为一条恢复记录追加到原批次下，原批次保留。
+      const record = createRecord(`恢复批次「${batch.name}」`, restored, { batchId: batch.id, batchName: batch.name });
+      return {
+        ...restored,
+        batches: restored.batches.map((item) =>
+          item.id === batch.id ? { ...item, records: [record, ...item.records].slice(0, RECORD_LIMIT) } : item,
+        ),
+      };
+    });
   };
 
   const exportText = () => {
@@ -690,7 +950,7 @@ export default function App() {
           <div class="inspector-tabs" role="tablist">
             <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
             <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
-            <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
+            <button class={inspectorTab === 'batches' ? 'active' : ''} onClick={() => setInspectorTab('batches')}>批次 {state.batches.length > 0 && <span>{state.batches.length}</span>}</button>
           </div>
           {inspectorTab === 'issues' && (
             <IssuesPanel
@@ -707,10 +967,7 @@ export default function App() {
               ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
             }));
           }} />}
-          {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
-            const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
-            restore(restored);
-          }} />}
+          {inspectorTab === 'batches' && <BatchesPanel state={state} onStartBatch={startBatch} onRecord={() => recordToBatch()} onRestore={applyRestore} />}
         </aside>
       </div>
     </div>

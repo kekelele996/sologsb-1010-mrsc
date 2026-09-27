@@ -52,12 +52,46 @@ export interface ProofIssue {
   resolved: boolean;
 }
 
-export interface VersionSnapshot {
+export interface BaselineLine {
+  id: string;
+  source: string;
+  status: LineStatus;
+  note: string;
+}
+
+export interface BaselineIssue {
+  key: string;
+  lineId: string;
+  ruleId?: string;
+  code: string;
+  severity: IssueSeverity;
+  message: string;
+}
+
+/** 批次开始或记录时刻捕获的内容：课文、规则集和未处理问题。 */
+export interface BatchContent {
+  lines: BaselineLine[];
+  activeRuleSetId: string;
+  ruleSets: RuleSet[];
+  openIssues: BaselineIssue[];
+}
+
+export interface BatchRecord {
+  id: string;
+  action: string;
+  kind: 'record' | 'restore';
+  createdAt: string;
+  content: BatchContent;
+  restoredBatchId?: string;
+  restoredBatchName?: string;
+}
+
+export interface ProofBatch {
   id: string;
   name: string;
   createdAt: string;
-  action: string;
-  snapshot: Omit<ProjectState, 'versions'>;
+  baseline: BatchContent;
+  records: BatchRecord[];
 }
 
 export interface ProjectState {
@@ -69,7 +103,7 @@ export interface ProjectState {
   lines: TextbookLine[];
   selectedLineId: string;
   issues: ProofIssue[];
-  versions: VersionSnapshot[];
+  batches: ProofBatch[];
   lastCheckedAt: string;
   updatedAt: string;
 }
