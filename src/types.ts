@@ -52,12 +52,79 @@ export interface ProofIssue {
   resolved: boolean;
 }
 
-export interface VersionSnapshot {
+/** 批次开始或某次记录时保留的课文、规则集与问题快照。 */
+export interface BatchSnapshot {
+  title: string;
+  author: string;
+  activeRuleSetId: string;
+  ruleSets: RuleSet[];
+  lines: TextbookLine[];
+  issues: ProofIssue[];
+}
+
+/** 恢复事件里指向被恢复记录的引用。 */
+export interface RestoreRef {
+  batchId: string;
+  batchName: string;
+  eventId: string;
+  eventName: string;
+}
+
+/** 批次内的一次行动：校对记录，或一次批次内容恢复（恢复前稿件也完整留存）。 */
+export interface BatchEvent {
+  id: string;
+  name: string;
+  kind: 'record' | 'restore';
+  createdAt: string;
+  action: string;
+  note: string;
+  snapshot: BatchSnapshot;
+  restoredFrom?: RestoreRef;
+}
+
+/** 可命名的校对批次：开始时的基线 + 之后每次记录。 */
+export interface ProofreadingBatch {
   id: string;
   name: string;
   createdAt: string;
-  action: string;
-  snapshot: Omit<ProjectState, 'versions'>;
+  baseline: BatchSnapshot;
+  events: BatchEvent[];
+}
+
+export interface LineDiffEntry {
+  lineId: string;
+  kind: 'added' | 'removed' | 'changed' | 'unchanged';
+  before?: TextbookLine;
+  after?: TextbookLine;
+  beforeIndex: number;
+  afterIndex: number;
+  changes: string[];
+}
+
+export interface RuleDiffEntry {
+  ruleSetName: string;
+  kind: 'added' | 'removed' | 'changed';
+  label: string;
+  detail: string;
+}
+
+export interface IssueDiffEntry {
+  issue: ProofIssue;
+  lineIndex: number;
+}
+
+export interface IssueDiff {
+  appeared: IssueDiffEntry[];
+  resolved: IssueDiffEntry[];
+  carried: IssueDiffEntry[];
+}
+
+export interface SnapshotDiff {
+  lines: LineDiffEntry[];
+  rules: RuleDiffEntry[];
+  settingChanges: string[];
+  issues: IssueDiff;
+  hasChanges: boolean;
 }
 
 export interface ProjectState {
@@ -69,7 +136,8 @@ export interface ProjectState {
   lines: TextbookLine[];
   selectedLineId: string;
   issues: ProofIssue[];
-  versions: VersionSnapshot[];
+  batches: ProofreadingBatch[];
+  activeBatchId: string;
   lastCheckedAt: string;
   updatedAt: string;
 }
